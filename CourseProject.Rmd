@@ -1,0 +1,207 @@
+---
+title: "Predicting Weight Lifting Exercises Results"
+author: "Andrea Piccioni"
+date: "8 March 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, cache = TRUE)
+library(dplyr)
+library(caret)
+library(corrplot)
+library(e1071)
+library(doSNOW)
+```
+
+### Introduction
+The paper [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201) gives us a lot of information on how the observations for this exercise were built, and this helps us making few hypothesis on how the raw data could be processed before the analysis.  
+The variables are logically correlated, since they are features calculated on four sensors used to track the movements on the body: mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness, which generate in total 96 derived features. 
+
+### Data exploration
+We load the training set and analyse its structure.
+The dependent variable is a factor with 5 levels and all the variables are expressed in numbers, but are classified as numeric, integers, and factors.
+```{r load training }
+training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+levels(training$classe)
+str(training)
+```
+Let's also load the testing set, which includes the same classifiers of the training set, from which differs only for the name of the outcome: this is called "problem_id" in the testing set and "classe" in the training set.
+```{r load testing}
+testing <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+```
+
+Looking at the structure of the data, we can see that the first columns/variables are mostly labels assigned to the samples while the measurements were collected and categorised:  
+1. "X": a serial number  
+2. "user_name": the name of who executes the exercise (6 individuals in total);  
+3. "raw_timestamp_part_1": a part of the time stamp assigned to each observation  
+4. "raw_timestamp_part_2": a part of the time stamp assigned to each observation  
+5. "cvtd_timestamp": date and time of the observation  
+6. "new_window": linked to the lag of time of the measurement  
+7. "num_window": an index linked to the lprevious parameter
+
+
+Another relevant fact of the data-set is the high number of missing values for many variables.
+```{r missing values, echo=FALSE}
+NAonly <- training %>%
+  select(which(colSums(is.na(.))>0))
+```
+`r length(NAonly)` variables out of the 160, include NA values: precisely `r sum(colSums(is.na(NAonly)))` missing values and `r sum(colSums(!is.na(NAonly)))` present.  
+
+### Preprocessing
+We merge the two datasets in first place, which will allow us later on to impute missing values, to explore the correlation, and the skewness of the parameters. 
+We will remove the first 4 columns only, as we think that the outcome should not be related to them; and we'll exclude the dependent variable for now.
+```{r preprocessing}
+train <- training[,-c(1:4,160)]
+test <- testing [,-c(1:4,160)]
+data <- rbind(train, test)
+```
+
+We assume that NA's correspond to feature values not significantly different from zero, so we'll impute a zero for each of them. In addition to that, we need to transform all the factor variables to numeric, to allow the analysis of covariances.
+
+```{r impute NA}
+data <- data %>%
+  mutate_if(is.factor, as.numeric) %>%
+  replace(., is.na(.), 0)
+```
+  
+#### Correlation
+We use the caret and corrplot packages to calculate and plot the correlation matrix: here only the first 30 variables were included in the graphs for more clarity.  
+
+```{r correlation, echo=FALSE, fig.height = 10, fig.width = 10}
+correlations <- cor(data)
+corrplot(correlations[1:30,1:30], order = "hclust")
+```  
+  
+Many variables show high correlation as expected.  
+We can try to minimize the incidence of those having more than a certain correlation manually: for example, we could keep only one between "standard_deviations" and "variances" for each sensor; and decide to keep "kurtosis" and remove "max" and "min", since the first takes into account the other two.   
+The alternative approach is to let R do all the job, by the findcorrelation() function in caret. For the sake of the exercise, we want to try both ways and to compare their results.  
+
+##### Manual data compression  
+We select the variables which include a measure of variance, maximum and minimum, and we remove them from the data-set:  
+```{r manual compression 1}
+
+data1 <- data[, -grep("^var_", colnames(data))] # any variable name starting with "var"
+data1 <- data1[, -grep("^min_", colnames(data))] # any variable name starting with "min"
+data1 <- data1[, -grep("^max_", colnames(data))] # any variable name starting with "max"
+```
+Then, we let R finish the job, by choosing a correlation of 0.8 as threshold; and we plot again the correlation matrix:  
+```{r manual compression 3, fig.height = 10, fig.width = 10}
+highCorr1 <- findCorrelation(correlations, cutoff = 0.8)
+data1 <- data1[,-highCorr1]
+correlations1 <- cor(data1)
+corrplot(correlations1[1:30,1:30], order = "hclust")
+```
+
+
+##### Automated data compression
+We use the findCorrelation() function which recursively search for the highest correlated variables, one by one, to exclude any variable having correlation>0.8.
+```{r automated data compression 1}
+highCorr <- findCorrelation(correlations, cutoff = 0.8)
+```
+
+According to the threshold, `r length(highCorr)` variables appear to be highly correlated. We filter out these variables and have a look at the correlation matrix again.    
+
+```{r automated data compression 2, fig.height = 10, fig.width = 10}
+data2 <- data[,-highCorr]
+correlations <- cor(data2)
+corrplot(correlations[1:30,1:30], order = "hclust")
+```  
+  
+#### Balance and Skewness of the variables  
+We look at how the balance in the distribution of each variable, to prevent issues related to skewness.  
+Looking at the predicted variable in particular, the balance seems not to be a problem, so no downsampling should be necessary. 
+```{r balance, echo=FALSE}
+table(training$classe)
+```
+The situation looks different for the predictors. We use the skewness function from the e1071 package, and we plot the skewness for both data-sets: the manual removal of some variables seems to have helped afterall.  
+```{r skewness 1, echo=FALSE}
+par(mfrow=c(1,2)) #set two columns for the plots
+skewValues1 <- apply(data1, 2, skewness)
+barplot(skewValues1)
+skewValues2 <- apply(data2, 2, skewness)
+barplot(skewValues2)
+```  
+  
+#### Data transformation  
+To reduce the skewness, we use the preProcess function in the caret package, by implementing the BoxCox method and a pca compression. 
+```{r skewness 2}
+transData1 <- preProcess(data1,
+                         method = c("BoxCox", "pca"))
+
+transData2 <- preProcess(data2,
+                         method = c("BoxCox", "pca"))
+```
+
+We can now apply the transformations to our data and have a look at the new plot of the skewness.  
+```{r transformation 1, echo=FALSE}
+par(mfrow=c(1,2)) #set two columns for the plots
+transformed1 <- predict(transData1, data1)
+skewValues1 <- apply(transformed1, 2, skewness)
+barplot(skewValues1)
+transformed2 <- predict(transData2, data2)
+skewValues2 <- apply(transformed2, 2, skewness)
+barplot(skewValues2)
+```
+  
+The datasets will now include respectively `r length(transformed1)` and `r length(transformed2)` predictors.  
+We rebuild training _transTrain1_ and _2_ and testing sets _transTest1_ and _2_ for the analysis (but still keeping out the dependent variable):
+```{r transformation 2}
+transTrain1 <- transformed1[1:nrow(training),]
+transTest1 <- transformed1[(nrow(training)+1):nrow(transformed1),]
+
+transTrain2 <- transformed2[1:nrow(training),]
+transTest2 <- transformed2[(nrow(training)+1):nrow(transformed2),]
+```
+
+### Train the model 
+A support vector machine algorithm applies in cases of classification problems with a small number of parameters and an intermediate number of observations (*[Machine Learning in Coursera - by Andrew Ng](https://www.coursera.org/learn/machine-learning)*).
+
+We will use the svm() function in e1071 with gaussian kernel and a k-fold CV of 10; and we will also measure the time of computation for both models as follows:
+```{r model fit}
+
+start.time1 <- Sys.time()
+
+y <- training$classe
+x <- transTrain1
+set.seed(123)
+svmFit1 <- svm(x, y, scale = FALSE,
+              type = "C-classification",
+              cross = 10,
+              kernel = "radial")
+
+total.time1 <- Sys.time()-start.time1
+summary(svmFit1)
+
+start.time2 <- Sys.time()
+
+y <- training$classe
+x <- transTrain2
+set.seed(123)
+svmFit2 <- svm(x, y, scale = FALSE,
+              type = "C-classification",
+              cross = 10,
+              kernel = "radial")
+
+total.time2 <- Sys.time()-start.time2
+summary(svmFit2)
+```
+The out-of-sample accuracy appears to be good across all the folds for both model fitted, with an average value over 90%: precisely, the total accuracy is `r svmFit1$tot.accuracy` for the first model, and `r svmFit2$tot.accuracy` for the second one; while the time to compute is slightly less (`r total.time1` minutes) for the first model, compared to the second one (`r total.time2` minutes).
+
+### Prediction
+We apply each model to the testing data-set and we plot a table to see the differences.
+```{r predictions 1, echo = FALSE}
+preds1 <- predict(svmFit1, transTest1)
+
+preds2 <- predict(svmFit2, transTest2)
+
+table(preds1, preds2)
+```
+The guesses are the same using the two models, which appear to be identical, in conclusion.
+```{r predictions 2, echo = FALSE}
+exp_outcome <- c("B","A","B","A","A","E","D","B","A","A","B","C","B","A","E","E","A","B","B","B")
+cm1 <- confusionMatrix(preds1, exp_outcome)
+cm2 <- confusionMatrix(preds2, exp_outcome)
+rbind(cm1$overall,cm2$overall)
+```
